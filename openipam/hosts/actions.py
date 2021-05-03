@@ -15,14 +15,15 @@ from openipam.hosts.models import (
     FreeformAttributeToHost,
     GulRecentArpByaddress,
     GulRecentArpBymac,
+    Attribute,
 )
 from openipam.hosts.forms import (
     HostOwnerForm,
     HostRenewForm,
-    HostAttributesCreateForm,
     HostAttributesDeleteForm,
     HostRenameForm,
     HostDhcpGroupForm,
+    HostNetworkForm,
 )
 
 import csv
@@ -272,7 +273,6 @@ def change_addresses(request, selected_hosts):
 
 def add_attribute_to_hosts(request, selected_hosts):
     user = request.user
-    attribute_form = HostAttributesCreateForm(data=request.POST)
 
     # Must have global change perm or object owner perm
     if not user.has_perm("hosts.change_host") and not change_perms_check(
@@ -284,41 +284,35 @@ def add_attribute_to_hosts(request, selected_hosts):
             "Please contact an IPAM administrator.",
         )
     else:
-        if attribute_form.is_valid():
+        attribute_list = request.POST.getlist("attribute")
+        attribute_choice_list = request.POST.getlist("attribute_choice")
+        attribute_text_list = request.POST.getlist("attribute_text")
+
+        for index, attribute_id in enumerate(attribute_list):
             for host in selected_hosts:
 
-                attribute = attribute_form.cleaned_data["add_attribute"]
+                attribute = Attribute.objects.get(pk=attribute_id)
 
                 if attribute.structured:
+                    StructuredAttributeToHost.objects.filter(
+                        host=host, structured_attribute_value__attribute=attribute
+                    ).delete()
                     StructuredAttributeToHost.objects.create(
                         host=host,
-                        structured_attribute_value=attribute_form.cleaned_data[
-                            "choice_value"
-                        ],
+                        structured_attribute_value_id=attribute_choice_list[index],
                         changed_by=user,
                     )
                 else:
-                    FreeformAttributeToHost.objects.create(
+                    FreeformAttributeToHost.objects.update_or_create(
                         host=host,
                         attribute=attribute,
-                        value=attribute_form.cleaned_data["text_value"],
-                        changed_by=user,
+                        defaults={
+                            "value": attribute_text_list[index],
+                            "changed_by": user,
+                        },
                     )
 
-            messages.success(request, "Attributes for selected hosts have been added.")
-
-        else:
-            error_list = []
-            for key, errors in list(attribute_form.errors.items()):
-                for error in errors:
-                    error_list.append(error)
-            messages.error(
-                request,
-                mark_safe(
-                    "There was an error adding attributes to the selected hosts. "
-                    "<br/>%s" % "<br />".join(error_list)
-                ),
-            )
+        messages.success(request, "Attributes for selected hosts have been added.")
 
 
 def delete_attribute_from_host(request, selected_hosts):
@@ -395,6 +389,37 @@ def set_dhcp_group_on_host(request, selected_hosts):
                     "<br/>%s" % "<br />".join(error_list)
                 ),
             )
+
+
+def change_network_on_host(request, selected_hosts):
+    user = request.user
+
+    if not user.is_superuser:
+        messages.error(
+            request,
+            "You do not have permissions to perform this action one or more of the selected hosts. "
+            "Please contact an IPAM administrator.",
+        )
+    else:
+        network_form = HostNetworkForm(data=request.POST)
+
+        if network_form.is_valid():
+            for host in selected_hosts:
+                host.user = user
+                host.network = network_form.cleaned_data["network"]
+                host.set_network_ip_or_pool(delete=True)
+                host.save(force_update=True)
+
+                LogEntry.objects.log_action(
+                    user_id=request.user.pk,
+                    content_type_id=ContentType.objects.get_for_model(host).pk,
+                    object_id=host.pk,
+                    object_repr=force_text(host),
+                    action_flag=CHANGE,
+                    change_message=f"Network changed to {host.network}.",
+                )
+
+    messages.success(request, "Network on selected host has been changed to ")
 
 
 def delete_dhcp_group_on_host(request, selected_hosts):

@@ -31,12 +31,12 @@ from openipam.hosts.forms import (
     HostOwnerForm,
     HostRenewForm,
     HostBulkCreateForm,
-    HostAttributesCreateForm,
     HostAttributesDeleteForm,
     HostRenameForm,
     HostDhcpGroupForm,
+    HostNetworkForm,
 )
-from openipam.hosts.models import Host, Disabled
+from openipam.hosts.models import Host, Disabled, Attribute, FreeformAttributeToHost
 from openipam.network.models import Address, AddressType
 from openipam.hosts.actions import (
     delete_hosts,
@@ -50,6 +50,7 @@ from openipam.hosts.actions import (
     rename_hosts,
     set_dhcp_group_on_host,
     delete_dhcp_group_on_host,
+    change_network_on_host,
 )
 from openipam.conf.ipam_settings import CONFIG
 
@@ -548,7 +549,8 @@ class HostListView(PermissionRequiredMixin, TemplateView):
         context["owners_form"] = HostOwnerForm()
         context["renew_form"] = HostRenewForm(user=self.request.user)
         context["rename_form"] = HostRenameForm()
-        context["attribute_add_from"] = HostAttributesCreateForm()
+        context["network_form"] = HostNetworkForm()
+        context["attribute_qs"] = Attribute.objects.all()
         context["dhcp_group_form"] = HostDhcpGroupForm()
         context["attribute_delete_from"] = HostAttributesDeleteForm()
 
@@ -592,6 +594,8 @@ class HostListView(PermissionRequiredMixin, TemplateView):
                 delete_attribute_from_host(request, selected_hosts)
             elif action == "set-dhcpgroup":
                 set_dhcp_group_on_host(request, selected_hosts)
+            elif action == "change-network":
+                change_network_on_host(request, selected_hosts)
             elif action == "delete-dhcpgroup":
                 delete_dhcp_group_on_host(request, selected_hosts)
 
@@ -900,6 +904,7 @@ class HostBulkCreateView(PermissionRequiredMixin, FormView):
             "dhcp_group",
             "user_owners",
             "group_owners",
+            "location",
         ]
 
         if len(host) < 3:
@@ -911,7 +916,7 @@ class HostBulkCreateView(PermissionRequiredMixin, FormView):
 
         for i in range(len(host)):
             if host[i]:
-                host_vals[fields[i]] = host[i]
+                host_vals[fields[i]] = host[i].strip()
 
         return host_vals
 
@@ -927,73 +932,108 @@ class HostBulkCreateView(PermissionRequiredMixin, FormView):
 
         required_fields = ["hostname", "mac", "expire_days"]
 
+        # Check for unique hostnames and mac addresses
+        macs, hostnames = [], []
+        for host in hosts:
+            hostnames.append(host[0])
+            macs.append(host[1])
+
         error_list = []
         host = {}
         try:
+            if len(hostnames) != len(set(hostnames)):
+                raise ValidationError(
+                    "Duplicate Hostnames detected.  Please make sure all hostnames are unique."
+                )
+
+            mac_dups = set([x for x in macs if macs.count(x) > 1])
+            if mac_dups:
+                raise ValidationError(
+                    f"Duplicate Mac Addresses detected.  ({','.join(mac_dups)})  Please make sure all mac addresses are unique."
+                )
+
             with transaction.atomic():
                 for i in range(len(hosts)):
-                    host = self.host_to_dict(hosts[i])
+                    try:
+                        host = self.host_to_dict(hosts[i])
+                        host_location = None
 
-                    for field in required_fields:
-                        if field not in host:
+                        for field in required_fields:
+                            if field not in host:
+                                raise ValidationError(
+                                    "Missing required field '%s' on row '%s'"
+                                    % (field, i + 1)
+                                )
+
+                        if (
+                            "ip" in host
+                            and ("network" in host or "pool" in host)
+                            or "network" in host
+                            and "pool" in host
+                        ):
                             raise ValidationError(
-                                "Missing required field '%s' on row '%s'"
-                                % (field, i + 1)
+                                "Cannot set more than one of network, pool, or ip"
                             )
 
-                    if (
-                        "ip" in host
-                        and ("network" in host or "pool" in host)
-                        or "network" in host
-                        and "pool" in host
-                    ):
-                        raise ValidationError(
-                            "Cannot set more than one of network, pool, or ip"
+                        if (
+                            "ip_address" not in host
+                            and "network" not in host
+                            and "pool" not in host
+                        ):
+                            host["pool"] = "routable-dynamic"
+
+                        if host["mac"] == "vmware":
+                            host["mac"] = Host.objects.find_next_mac(vendor="vmware")
+
+                        if "user_owners" in host:
+                            user_owners = host["user_owners"].split(",")
+                            user_owners = [user.upper() for user in user_owners]
+                            users_check = [
+                                user.username
+                                for user in User.objects.filter(
+                                    username__in=user_owners
+                                )
+                            ]
+                            users_diff = set(user_owners) - set(users_check)
+                            if users_diff:
+                                raise ValidationError(
+                                    "Unknown User(s): %s" % ",".join(users_diff)
+                                )
+                            host["user_owners"] = user_owners
+
+                        if "group_owners" in host:
+                            group_owners = host["group_owners"].split(",")
+                            groups_check = [
+                                group.name
+                                for group in Group.objects.filter(name__in=group_owners)
+                            ]
+                            groups_diff = set(group_owners) - set(groups_check)
+                            if groups_diff:
+                                raise ValidationError(
+                                    "Unknown Groups(s): %s" % ",".join(groups_diff)
+                                )
+                            host["group_owners"] = group_owners
+
+                        if "location" in host:
+                            host_location = host["location"]
+                            del host["location"]
+
+                        instance = Host.objects.add_or_update_host(
+                            self.request.user, **host
                         )
 
-                    if (
-                        "ip_address" not in host
-                        and "network" not in host
-                        and "pool" not in host
-                    ):
-                        host["pool"] = "routable-dynamic"
-
-                    if host["mac"] == "vmware":
-                        host["mac"] = Host.objects.find_next_mac(vendor="vmware")
-
-                    if "user_owners" in host:
-                        user_owners = host["user_owners"].split(",")
-                        user_owners = [user.upper() for user in user_owners]
-                        users_check = [
-                            user.username
-                            for user in User.objects.filter(username__in=user_owners)
-                        ]
-                        users_diff = set(user_owners) - set(users_check)
-                        if users_diff:
-                            raise ValidationError(
-                                "Unknown User(s): %s" % ",".join(users_diff)
+                        if host_location:
+                            # Add location for attributes
+                            FreeformAttributeToHost.objects.create(
+                                host=instance,
+                                attribute=Attribute.objects.get(name="location"),
+                                value=host_location,
+                                changed_by=self.request.user,
                             )
-                        host["user_owners"] = user_owners
-
-                    if "group_owners" in host:
-                        group_owners = host["group_owners"].split(",")
-                        groups_check = [
-                            group.name
-                            for group in Group.objects.filter(name__in=group_owners)
-                        ]
-                        groups_diff = set(group_owners) - set(groups_check)
-                        if groups_diff:
-                            raise ValidationError(
-                                "Unknown Groups(s): %s" % ",".join(groups_diff)
-                            )
-                        host["group_owners"] = group_owners
-
-                    try:
-                        Host.objects.add_or_update_host(self.request.user, **host)
                     except Exception as e:
                         error_list.append("Error adding host from row %s" % (i + 1))
                         error_list.append(str(e))
-                        raise ValidationError
+                        raise ValidationError("")
 
         except ValidationError as e:
             if hasattr(e, "error_dict"):

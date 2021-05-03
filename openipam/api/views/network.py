@@ -9,7 +9,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework import viewsets
 from rest_framework.views import APIView
-from rest_framework.parsers import FormParser
+from rest_framework.parsers import FormParser, JSONParser
 
 from openipam.network.models import (
     Network,
@@ -34,13 +34,11 @@ from openipam.api.permissions import IPAMAPIAdminPermission
 from ipaddress import IPv4Network
 
 
-class RouterUpgrade(APIView):
-
-    permission_classes = (IsAuthenticated, IPAMAPIAdminPermission)
-    parser_classes = [FormParser]
-
+class IPAMNetwork(APIView):
     @transaction.atomic
-    def update_vlan(self, vlan_id, building, name, user, networks=None):
+    def create_vlan(
+        self, vlan_id, building, name, user, networks=None, downstream_ids=None
+    ):
 
         # Create Vlans and Building to Vlans
         abbrev = building.abbreviation.upper()
@@ -48,14 +46,23 @@ class RouterUpgrade(APIView):
         vlan, created = Vlan.objects.get_or_create(
             vlan_id=vlan_id, name=vlan_name, defaults={"changed_by": user}
         )
-        BuildingToVlan.objects.create(building=building, vlan=vlan, changed_by=user)
+        BuildingToVlan.objects.get_or_create(
+            building=building, vlan=vlan, defaults={"changed_by": user}
+        )
+
+        if downstream_ids:
+            downstream_buildings = Building.objects.filter(number__in=downstream_ids)
+            for building in downstream_buildings:
+                BuildingToVlan.objects.get_or_create(
+                    building=building, vlan=vlan, defaults={"changed_by": user}
+                )
 
         shared_network = None
         if not networks:
             networks = []
         else:
-            shared_network = SharedNetwork.objects.create(
-                name=vlan_name, changed_by=user
+            shared_network, created = SharedNetwork.objects.get_or_create(
+                name=vlan_name, defaults={"changed_by": user}
             )
 
         for network in networks:
@@ -65,8 +72,8 @@ class RouterUpgrade(APIView):
                 network_to_vlan.changed_by = user
                 network_to_vlan.save()
             else:
-                NetworkToVlan.objects.create(
-                    network=network, vlan=vlan, changed_by=user
+                NetworkToVlan.objects.get_or_create(
+                    network=network, vlan=vlan, defaults={"changed_by": user}
                 )
             network.name = vlan_name
             network.description = (
@@ -78,6 +85,8 @@ class RouterUpgrade(APIView):
                 network.shared_network = None
             network.save()
 
+        return vlan
+
     @transaction.atomic
     def create_network(self, network_str, building, name, user, dhcp_group_name=None):
         network = IPv4Network(network_str, False)
@@ -87,41 +96,94 @@ class RouterUpgrade(APIView):
         dhcp_group = None
         if dhcp_group_name:
             dhcp_group = DhcpGroup.objects.filter(name=dhcp_group_name).first()
-        network = Network.objects.create(
+        network, created = Network.objects.get_or_create(
             network=network,
-            name=network_name,
-            gateway=gateway,
-            dhcp_group=dhcp_group,
-            changed_by=user,
+            defaults={
+                "name": network_name,
+                "gateway": gateway,
+                "dhcp_group": dhcp_group,
+                "changed_by": user,
+            },
         )
 
-        # Create addresses for captive portal network
-        addresses = []
-        for address in network.network:
-            reserved = False
-            if address in (network.gateway, network.network[0], network.network[-1]):
-                reserved = True
-            pool = (
-                DefaultPool.objects.get_pool_default(address) if not reserved else None
-            )
-            addresses.append(
-                # TODO: Need to set pool eventually.
-                Address(
-                    address=address,
-                    network=network,
-                    reserved=reserved,
-                    pool=pool,
-                    changed_by=user,
+        # Create addresses if network was created, otherwise pass.
+        if created:
+            # Create addresses for captive portal network
+            addresses = []
+            for address in network.network:
+                reserved = False
+                if address in (
+                    network.gateway,
+                    network.network[0],
+                    network.network[-1],
+                ):
+                    reserved = True
+                pool = (
+                    DefaultPool.objects.get_pool_default(address)
+                    if not reserved
+                    else None
                 )
-            )
-        if addresses:
-            Address.objects.bulk_create(addresses)
+                addresses.append(
+                    # TODO: Need to set pool eventually.
+                    Address(
+                        address=address,
+                        network=network,
+                        reserved=reserved,
+                        pool=pool,
+                        changed_by=user,
+                    )
+                )
+            if addresses:
+                Address.objects.bulk_create(addresses)
 
         return network
 
+
+class CreateIPAMNetwork(IPAMNetwork):
+    permission_classes = (IsAuthenticated, IPAMAPIAdminPermission)
+    parser_classes = [FormParser, JSONParser]
+
     @transaction.atomic
     def post(self, request, format=None, **kwargs):
-        serializer = network_serializers.RouterUpgradeSerializer(data=request.data)
+        serializer = network_serializers.IPAMNetworkSerializer(data=request.data)
+        if not serializer.is_valid(raise_exception=True):
+            return Response({"serializer": serializer})
+
+        building = serializer.data["building"]
+        vlan_id = serializer.data["vlan_id"]
+        name = serializer.data["name"]
+        dhcp_group_name = serializer.data.get("dhcp_group_name", None)
+        downstream_ids = serializer.data.get("downstream_ids", None)
+
+        network = self.create_network(
+            network_str=serializer.data["network"],
+            building=building,
+            name=name,
+            user=request.user,
+            dhcp_group_name=dhcp_group_name,
+        )
+
+        # Create Vlans and Building to Vlans
+        self.create_vlan(
+            vlan_id=vlan_id,
+            building=building,
+            user=request.user,
+            networks=[network],
+            name=name,
+            downstream_ids=downstream_ids,
+        )
+
+        return Response("Ok!")
+
+
+class ConvertIPAMNetwork(IPAMNetwork):
+
+    permission_classes = (IsAuthenticated, IPAMAPIAdminPermission)
+    parser_classes = [FormParser, JSONParser]
+
+    @transaction.atomic
+    def post(self, request, format=None, **kwargs):
+        serializer = network_serializers.ConvertIPAMNetworkSerializer(data=request.data)
         if not serializer.is_valid(raise_exception=True):
             return Response({"serializer": serializer})
 
@@ -131,7 +193,7 @@ class RouterUpgrade(APIView):
 
         # Create Vlans and Building to Vlans
         # Vlan 10 - routable
-        self.update_vlan(
+        self.create_vlan(
             vlan_id="10",
             building=building,
             user=request.user,
@@ -139,7 +201,7 @@ class RouterUpgrade(APIView):
             name="campus_routable",
         )
         # Vlan 20 - non-routable
-        self.update_vlan(
+        self.create_vlan(
             vlan_id="20",
             building=building,
             user=request.user,
@@ -156,7 +218,7 @@ class RouterUpgrade(APIView):
                 user=request.user,
                 dhcp_group_name="restricted",
             )
-            self.update_vlan(
+            self.create_vlan(
                 vlan_id="30",
                 building=building,
                 user=request.user,
@@ -173,7 +235,7 @@ class RouterUpgrade(APIView):
                 user=request.user,
                 dhcp_group_name="restricted",
             )
-            self.update_vlan(
+            self.create_vlan(
                 vlan_id="39",
                 building=building,
                 user=request.user,
@@ -190,7 +252,7 @@ class RouterUpgrade(APIView):
                 user=request.user,
                 dhcp_group_name="usu_shoretel_phones-untagged",
             )
-            self.update_vlan(
+            self.create_vlan(
                 vlan_id="40",
                 building=building,
                 user=request.user,
@@ -205,7 +267,7 @@ class RouterUpgrade(APIView):
             name="management",
             user=request.user,
         )
-        self.update_vlan(
+        self.create_vlan(
             vlan_id="90",
             building=building,
             user=request.user,
@@ -325,7 +387,7 @@ class AddressList(generics.ListAPIView):
 
 class AddressDetail(generics.RetrieveAPIView):
     """
-        Gets details for an address.
+    Gets details for an address.
     """
 
     queryset = Address.objects.select_related("network").all()
@@ -417,7 +479,7 @@ class VlanViewSet(viewsets.ModelViewSet):
 
 
 class BuildingViewSet(viewsets.ModelViewSet):
-    queryset = Building.objects.select_related("changed_by").all()
+    queryset = Building.objects.prefetch_related("changed_by", "building_vlans").all()
     filter_fields = ("number", "abbreviation")
     lookup_field = "number"
     permission_classes = (IsAuthenticated, IPAMAPIAdminPermission)

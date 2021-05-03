@@ -328,7 +328,8 @@ class HostForm(forms.ModelForm):
                 add_link = ""
                 if self.user.is_ipamadmin:
                     add_link = (
-                        '<a href="%s" class="pull-left renew">Add/Delete Additional Addresses</a>'
+                        '<a href="%s" class="pull-left renew">'
+                        "Add/Delete Additional Addresses</a>"
                         % reverse(
                             "add_addresses_host",
                             kwargs={"pk": self.instance.mac_stripped},
@@ -807,3 +808,7 @@ class HostDisableForm(forms.ModelForm):
 
 class HostDhcpGroupForm(forms.Form):
     dhcp_group = forms.ModelChoiceField(queryset=DhcpGroup.objects.all())
+
+
+class HostNetworkForm(forms.Form):
+    network = forms.ModelChoiceField(queryset=Network.objects.all())
